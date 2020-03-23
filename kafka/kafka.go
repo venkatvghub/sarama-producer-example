@@ -1,11 +1,14 @@
 package kafka
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"github.com/Shopify/sarama"
+	"log"
+	"os"
 	"time"
-	"fmt"
 )
 
 const (
@@ -60,11 +63,16 @@ type ProducerConfig struct {
 	UserKey         string
 	CACertificate   string
 	KafkaVersion    string
+	DebugEnabled bool
 }
 
 type KafkaQueue struct {
 	Producer sarama.AsyncProducer
+	ctx context.Context
+	cancelFunction context.CancelFunc
 }
+
+
 
 func isIntFieldSet(v int) bool {
 	return v != 0
@@ -103,9 +111,9 @@ func getKafkaConfig(pConfig *ProducerConfig) (*sarama.Config, error){
 	if kafkaVersion == "" {
 		kafkaVersion = DefaultKafkaVersion
 	}
-	version, err := sarama.ParseKafkaVersion(DefaultKafkaVersion)
+	version, err := sarama.ParseKafkaVersion(kafkaVersion)
 	if err != nil {
-		fmt.Printf("Incorrect kafka version, Provided: %s, Max Available: %s, err: %s",kafkaVersion, sarama.MaxVersion, err.Error())
+		log.Print(err)
 		return nil, err
 	}
 	config.Version = version
@@ -132,14 +140,14 @@ func getKafkaConfig(pConfig *ProducerConfig) (*sarama.Config, error){
 		if pConfig.CACertificate != "" && pConfig.UserCertificate != "" && pConfig.UserKey != ""{
 			tlsConfig, err := newTLSConfig(pConfig.UserCertificate, pConfig.UserKey, pConfig.CACertificate)
 			if err != nil {
-				fmt.Printf("Error constructing Kafka TLS Config:%v\n", err)
+				log.Print(err)
 				return nil, err
 			} else {
 				config.Net.TLS.Enable = true
 				config.Net.TLS.Config = tlsConfig
 			}
 		}  else{
-			fmt.Printf("TLS Enabled but one of the required fields of cacert/usercert/userkey is empty. Avoiding TLS")
+			log.Print(errors.New("TLS Enabled but one of the required fields of cacert/usercert/userkey is empty. Avoiding TLS"))
 		}
 	}
 
@@ -148,7 +156,7 @@ func getKafkaConfig(pConfig *ProducerConfig) (*sarama.Config, error){
 		if val, ok := compressionCodecMap[pConfig.CompressionType]; ok {
 			config.Producer.Compression = val
 		} else {
-			fmt.Printf("Compression enabled with unknown compression type:[%v]. Defaulting to Snappy Compression\n")
+			log.Printf("Provided Compression:%v unknown", pConfig.CompressionType)
 		}
 	}
 
@@ -156,8 +164,12 @@ func getKafkaConfig(pConfig *ProducerConfig) (*sarama.Config, error){
 	if val, ok := partitionerMap[pConfig.Partitioner]; ok {
 		config.Producer.Partitioner = val
 	} else {
-		fmt.Printf("Partioning algorithm specified[%v] is not valid. Resorting to default")
+		log.Printf("Partitioning algorithm provided is incorrect:%v", pConfig.Partitioner)
 		config.Producer.Partitioner = sarama.NewRandomPartitioner
+	}
+	if pConfig.DebugEnabled{
+		// Sarama quite stupidly doesn't allow any other logger other than standard logger. So, in some stupid ways, we are extending this
+		sarama.Logger = log.New(os.Stderr, "", log.LstdFlags)
 	}
 
 
@@ -181,17 +193,25 @@ func getKafkaConfig(pConfig *ProducerConfig) (*sarama.Config, error){
 	return config, nil
 }
 
-//NewKafkaProducer Sends message(string) to a given topic asynchronously
-func NewKafkaProducer(pConfig *ProducerConfig) (*KafkaQueue, error) {
+
+
+//NewKafkaProducer Creates a new Kafka Producer
+func NewKafkaProducer(ctx context.Context, pConfig *ProducerConfig) (*KafkaQueue, error) {
 	config, err := getKafkaConfig(pConfig)
 	if err != nil {
 		return nil, err
 	}
+
 	producer, err := sarama.NewAsyncProducer(pConfig.Brokers, config)
 	if err != nil {
 		return nil, err
 	}
-	return &KafkaQueue{producer}, nil
+	// Rouge context check. We will need some context for graceful termination
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctxCancel, cancelFunction := context.WithCancel(ctx)
+	return &KafkaQueue{Producer:producer, ctx: ctxCancel, cancelFunction:cancelFunction}, nil
 }
 
 func prepareMessage(topic, message string) *sarama.ProducerMessage {
@@ -205,11 +225,30 @@ func prepareMessage(topic, message string) *sarama.ProducerMessage {
 }
 
 //SendMessage Sends message(string) to a given topic asynchronously
-func (q KafkaQueue) SendMessage(message string, topicName string) error {
-	q.Producer.Input() <- prepareMessage(topicName, message)
+func (q KafkaQueue) SendMessage(ctx context.Context, message string, topicName string) error {
+	select {
+	case <-q.ctx.Done():
+		return nil
+	case <-ctx.Done():
+		return nil
+	default:
+		q.Producer.Input() <- prepareMessage(topicName, message)
+		return nil
+	}
+}
+//Retry Kafka retry implementation is built inside the code. This method isn't implemented here
+func (q KafkaQueue) Retry(ctx context.Context, message string, topicName string) error {
+	log.Print("Not Implemented")
 	return nil
 }
 
+//Disconnect Disconnect the kafka producer
 func (q KafkaQueue) Disconnect() {
+	q.cancelFunction()
 	q.Producer.AsyncClose()
+}
+
+//Context Gets the current producer context for handling cancellations
+func (q KafkaQueue) Context() context.Context{
+	return q.ctx
 }
